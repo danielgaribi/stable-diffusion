@@ -19,6 +19,8 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 
+from resizer import Resizer
+
 
 def chunk(it, size):
     it = iter(it)
@@ -50,6 +52,7 @@ def load_img(path):
     w, h = image.size
     print(f"loaded input image of size ({w}, {h}) from {path}")
     w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    w = h = 512
     image = image.resize((w, h), resample=PIL.Image.LANCZOS)
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
@@ -140,7 +143,7 @@ def main():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=2,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a batch size",
     )
     parser.add_argument(
@@ -192,6 +195,41 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--down_n",
+        type=int,
+        help="down_N",
+        default=2
+    )
+    parser.add_argument(
+        "--range_t",
+        type=int,
+        help="range_t",
+        default=125
+    )
+    parser.add_argument(
+        "--gpu_id",
+        type=int,
+        help="gpu_id",
+        default=0
+    )
+    parser.add_argument(
+        "--latent_ilvr",
+        action='store_true',
+        help="do latent_ilvr",
+    )
+    parser.add_argument(
+        "--sd_edit",
+        action='store_true',
+        help="do sd_edit",
+    )
+    parser.add_argument(
+        "--ilvr_strength",
+        type=float,
+        default=1.0,
+        help="strength for ilvr process",
+    )
+
 
     opt = parser.parse_args()
     seed_everything(opt.seed)
@@ -240,6 +278,14 @@ def main():
     t_enc = int(opt.strength * opt.ddim_steps)
     print(f"target t_enc is {t_enc} steps")
 
+    shape = init_image.shape
+    if opt.latent_ilvr:
+        shape = (shape[0], 4, shape[2] // 8, shape[3] // 8)
+    shape_d = (shape[0], shape[1], shape[2] // opt.down_n, shape[3] // opt.down_n)
+    down = Resizer(shape, 1 / opt.down_n).to(init_latent.device)
+    up = Resizer(shape_d, opt.down_n).to(init_latent.device)
+    resizers = (down, up)
+
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
     with torch.no_grad():
         with precision_scope("cuda"):
@@ -256,10 +302,15 @@ def main():
                         c = model.get_learned_conditioning(prompts)
 
                         # encode (scaled latent)
-                        z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
+                        if opt.sd_edit:
+                            z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
+                        else:
+                            z_enc = torch.randn(init_latent.shape, device=init_latent.device)
                         # decode it
                         samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=opt.scale,
-                                                 unconditional_conditioning=uc,)
+                                                 unconditional_conditioning=uc,
+                                                 resizers=resizers, range_t=opt.range_t, x_init_latent=init_latent,
+                                                 latent_ilvr=opt.latent_ilvr, ilvr_strength=opt.ilvr_strength)
 
                         x_samples = model.decode_first_stage(samples)
                         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
