@@ -19,6 +19,8 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 
+from resizer import Resizer
+
 
 def chunk(it, size):
     it = iter(it)
@@ -240,50 +242,67 @@ def main():
     t_enc = int(opt.strength * opt.ddim_steps)
     print(f"target t_enc is {t_enc} steps")
 
+    down_ns = [2, 4, 8, 16, 32]
+    range_ts = [1050]
+    stengths = [1]
+    scales = [5]
+
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
-                tic = time.time()
-                all_samples = list()
-                for n in trange(opt.n_iter, desc="Sampling"):
-                    for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
+                for down_n in down_ns:
+                    for range_t in range_ts:
+                        for stength in stengths:
+                            for scale in scales:
+                                shape = (batch_size, 3, 1024, 1024)
+                                # shape = init_latent.shape
+                                shape_d = (shape[0], shape[1], shape[2] // down_n, shape[3] // down_n)
+                                down = Resizer(shape, 1 / down_n).to(init_latent.device)
+                                up = Resizer(shape_d, down_n).to(init_latent.device)
+                                resizers = (down, up)
 
-                        # encode (scaled latent)
-                        z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
-                        # decode it
-                        samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=opt.scale,
-                                                 unconditional_conditioning=uc,)
+                                tic = time.time()
+                                all_samples = list()
+                                for n in trange(opt.n_iter, desc="Sampling"):
+                                    for prompts in tqdm(data, desc="data"):
+                                        uc = None
+                                        if opt.scale != 1.0:
+                                            uc = model.get_learned_conditioning(batch_size * [""])
+                                        if isinstance(prompts, tuple):
+                                            prompts = list(prompts)
+                                        c = model.get_learned_conditioning(prompts)
 
-                        x_samples = model.decode_first_stage(samples)
-                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                                        # encode (scaled latent)
+                                        z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
+                                        # z_enc = init_latent
+                                        # decode it
+                                        samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=scale,
+                                                                 unconditional_conditioning=uc, resizers=resizers, stength=stength, range_t=range_t)
 
-                        if not opt.skip_save:
-                            for x_sample in x_samples:
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                Image.fromarray(x_sample.astype(np.uint8)).save(
-                                    os.path.join(sample_path, f"{base_count:05}.png"))
-                                base_count += 1
-                        all_samples.append(x_samples)
+                                        x_samples = model.decode_first_stage(samples)
+                                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
-                if not opt.skip_grid:
-                    # additionally, save as grid
-                    grid = torch.stack(all_samples, 0)
-                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                    grid = make_grid(grid, nrow=n_rows)
+                                        if not opt.skip_save:
+                                            for x_sample in x_samples:
+                                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                                                Image.fromarray(x_sample.astype(np.uint8)).save(
+                                                    os.path.join(sample_path, f"{base_count:05}_N-{down_n}_range-t-{range_t}_stength-{stength}_scale-{scale}.png"))
+                                        all_samples.append(x_samples)
 
-                    # to image
-                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    Image.fromarray(grid.astype(np.uint8)).save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                    grid_count += 1
+                                if not opt.skip_grid:
+                                    # additionally, save as grid
+                                    grid = torch.stack(all_samples, 0)
+                                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+                                    grid = make_grid(grid, nrow=n_rows)
 
-                toc = time.time()
+                                    # to image
+                                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+                                    Image.fromarray(grid.astype(np.uint8)).save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+                                    grid_count += 1
+
+                                toc = time.time()
+                base_count += 1
 
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")

@@ -8,7 +8,6 @@ from functools import partial
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, \
     extract_into_tensor
 
-
 class DDIMSampler(object):
     def __init__(self, model, schedule="linear", **kwargs):
         super().__init__()
@@ -219,9 +218,14 @@ class DDIMSampler(object):
         return (extract_into_tensor(sqrt_alphas_cumprod, t, x0.shape) * x0 +
                 extract_into_tensor(sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise)
 
+    def q_sample(self, x_start, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+                extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise)
+
     @torch.no_grad()
     def decode(self, x_latent, cond, t_start, unconditional_guidance_scale=1.0, unconditional_conditioning=None,
-               use_original_steps=False):
+               use_original_steps=False, resizers=None, stength=1, range_t=None):
 
         timesteps = np.arange(self.ddpm_num_timesteps) if use_original_steps else self.ddim_timesteps
         timesteps = timesteps[:t_start]
@@ -232,10 +236,23 @@ class DDIMSampler(object):
 
         iterator = tqdm(time_range, desc='Decoding image', total=total_steps)
         x_dec = x_latent
+        x_dec = torch.randn(x_latent.shape, device=x_latent.device)
+        down, up = resizers
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
             ts = torch.full((x_latent.shape[0],), step, device=x_latent.device, dtype=torch.long)
             x_dec, _ = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
                                           unconditional_guidance_scale=unconditional_guidance_scale,
                                           unconditional_conditioning=unconditional_conditioning)
+
+            #### ILVR ####
+            if resizers is not None:
+                if step > range_t:
+                    x_dec_non_latend = self.model.decode_first_stage(x_dec)
+                    x_latent_non_latend = self.model.decode_first_stage(self.model.q_sample(x_latent, ts))
+                    x_dec_non_latend = x_dec_non_latend - up(down(x_dec_non_latend)) + up(down(x_latent_non_latend))
+                    x_dec = self.model.get_first_stage_encoding(self.model.encode_first_stage(x_dec_non_latend))
+
+                    # x_dec = x_dec - stength * up(down(x_dec)) + stength * up(down(self.model.q_sample(x_latent, ts)))
+
         return x_dec
