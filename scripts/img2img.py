@@ -20,6 +20,7 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 
 from resizer import Resizer
+from clearml import Task
 
 
 def chunk(it, size):
@@ -233,6 +234,8 @@ def main():
 
     opt = parser.parse_args()
     seed_everything(opt.seed)
+
+    task = Task.init(project_name="Stable-Diffusion-ILVR", task_name="training")
 
     config = OmegaConf.load(f"{opt.config}")
     model = load_model_from_config(config, f"{opt.ckpt}")
