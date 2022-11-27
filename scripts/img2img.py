@@ -10,14 +10,16 @@ from tqdm import tqdm, trange
 from itertools import islice
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
-from torch import autocast
+from torch import autocast, nn
 from contextlib import nullcontext
 import time
 from pytorch_lightning import seed_everything
+from datetime import datetime
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
+from ldm.modules.encoders.modules import FrozenClipImageEmbedder, FrozenCLIPTextEmbedder
 
 from resizer import Resizer
 from clearml import Task
@@ -60,6 +62,14 @@ def load_img(path):
     image = torch.from_numpy(image)
     return 2.*image - 1.
 
+
+def get_clip_loss(img_encoder, text_encoder, image, text):
+    loss = nn.MSELoss()
+    image = image.to("cpu").float()
+    img_encoder.float()
+    image_enc = img_encoder(image)
+    text_enc = text_encoder(text)
+    return loss(image_enc, text_enc)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -159,7 +169,6 @@ def main():
         default=5.0,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
-
     parser.add_argument(
         "--strength",
         type=float,
@@ -235,7 +244,7 @@ def main():
     opt = parser.parse_args()
     seed_everything(opt.seed)
 
-    task = Task.init(project_name="Stable-Diffusion-ILVR", task_name="training")
+    task = Task.init(project_name="Stable-Diffusion-ILVR", task_name=f"{datetime.now().strftime('%m-%d-%Y-%H-%M-%S')}")
 
     config = OmegaConf.load(f"{opt.config}")
     model = load_model_from_config(config, f"{opt.ckpt}")
@@ -289,6 +298,9 @@ def main():
     up = Resizer(shape_d, opt.down_n).to(init_latent.device)
     resizers = (down, up)
 
+    clip_text_encoder = FrozenCLIPTextEmbedder(version='ViT-L/14', device="cpu").to("cpu")
+    clip_img_encoder = FrozenClipImageEmbedder(model='ViT-L/14', device="cpu").to("cpu")
+
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
     with torch.no_grad():
         with precision_scope("cuda"):
@@ -316,6 +328,13 @@ def main():
                                                  latent_ilvr=opt.latent_ilvr, ilvr_strength=opt.ilvr_strength)
 
                         x_samples = model.decode_first_stage(samples)
+
+                        #get clip loss
+                        task.get_logger().report_scalar(
+                            "clip_loss", "clip_loss", iteration=0,
+                            value=get_clip_loss(clip_img_encoder, clip_text_encoder, x_samples, prompts)
+                        )
+
                         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
                         if not opt.skip_save:
@@ -334,7 +353,15 @@ def main():
 
                     # to image
                     grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    Image.fromarray(grid.astype(np.uint8)).save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+                    pil_image = Image.fromarray(grid.astype(np.uint8))
+                    pil_image.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+
+                    task.get_logger().report_image(
+                        "image",
+                        "image PIL",
+                        image=pil_image
+                    )
+
                     grid_count += 1
 
                 toc = time.time()
